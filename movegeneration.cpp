@@ -6,6 +6,7 @@
 #include <set>
 #include <map>
 #include <array>
+#include <cmath>
 //#include "chess.h"
 
 /*
@@ -97,6 +98,14 @@ class MoveGeneration {
         int64_t white_pieces = white_pawns | white_knights | white_bishops | white_rooks | white_queens | white_king;
         int64_t black_pieces = black_pawns | black_knights | black_bishops | black_rooks | black_queens | black_king;
 
+        int64_t nW[64];
+        int64_t nE[64];
+        int64_t sW[64];
+        int64_t sE[64];
+        int64_t n[64];
+        int64_t s[64];
+        int64_t e[64];
+        int64_t w[64];
         
         bool whiteTurn;
         bool whiteKingMoved;
@@ -120,6 +129,7 @@ class MoveGeneration {
         void make_move(Move);
         void undo_move(Move);
         void set_fen(string);
+        void initialize_rays();
         bool empty_square(int);
         vector<Move> bitboard_to_moves(int64_t, int, pieces);
         vector<Move> generate_all_moves();
@@ -151,8 +161,14 @@ class MoveGeneration {
             blackACastle = true;
             blackHCastle = true;
             enPassantSquare = -1;
+
+            white_pieces = white_pawns | white_knights | white_bishops | white_rooks | white_queens | white_king;
+            black_pieces = black_pawns | black_knights | black_bishops | black_rooks | black_queens | black_king;
         }
 };
+
+int64_t eastOne (int64_t b) {return (b << 1) & 0xfefefefefefefefe;}
+int64_t westOne (int64_t b) {return (b >> 1) & 0x7f7f7f7f7f7f7f7f;}
 
 void move_bit(int64_t* val, int oldPos, int newPos) {
     int64_t mask = 1ULL << oldPos;   // Create mask for the bit at oldPos
@@ -215,217 +231,199 @@ void print_board(int64_t bitboard) {
     }
 }
 
+/*
+int board[8][8] = {
+    {63, 62, 61, 60, 59, 58, 57, 56},
+    {55, 54, 53, 52, 51, 50, 49, 48},
+    {47, 46, 45, 44, 43, 42, 41, 40},
+    {39, 38, 37, 36, 35, 34, 33, 32},
+    {31, 30, 29, 28, 27, 26, 25, 24},
+    {23, 22, 21, 20, 19, 18, 17, 16},
+    {15, 14, 13, 12, 11, 10,  9,  8},
+    {7,   6,  5,  4,  3,  2,  1,  0}
+};
+*/
+
+void MoveGeneration::initialize_rays(){
+    int64_t northWest;
+    int64_t northEast;
+    int64_t southWest;
+    int64_t southEast;
+    int64_t north = 0x0101010101010100;
+    int64_t south = 0x0080808080808080;
+    int64_t east;
+    int64_t west;
+    //north rays
+    for (int i = 0; i < 64; i++) {
+        n[i] = north << i;
+        w[i] = 2*( (1ULL << (i|7)) - (1ULL << i));
+        e[i] = ((1ULL << i) - (1ULL << (i & ~7)));
+    }
+
+    //south rays
+    for (int i = 63; i >= 0; i--) {
+        s[63 - i] = south >> i;
+    }
+
+    
+    int64_t noea = (0x8040201008040200);
+    for (int f=0; f < 8; f++, noea = eastOne(noea)) {
+        int64_t norte = noea;
+        for (int r8 = 0; r8 < 8*8; r8 += 8, norte <<= 8){
+            nW[r8 + f] = norte;
+        }
+    }
+
+    
+    int64_t nowe = 0x0102040810204000;
+    for (int f=7; f >= 0; f--, nowe = westOne(nowe)) {
+        int64_t nortwe = nowe;
+        for (int r8 = 0; r8 < 8*8; r8 += 8, nortwe <<= 8){
+            nE[r8 + f] = nortwe;
+        }
+    }
+
+    
+    int64_t sowe = 0x0002040810204080;
+    for (int f=7; f >= 0; f--, sowe = eastOne(sowe)) {
+        int64_t souwe = sowe;
+        for (int r8 = 63; r8 >= 0; r8 -= 8, souwe >>= 8){
+            sW[r8 - f] = souwe;
+        }
+    }
+
+    int64_t soea = 0x0040201008040201;
+
+    for (int f=0; f < 8; f++, soea = westOne(soea)) {
+        int64_t souea = soea;
+        for (int r8 = 63; r8 >= 0; r8 -= 8, souea >>= 8){
+            sE[r8 - f] = souea;
+        }
+    }
+}
+
 int64_t MoveGeneration::generate_diagonal_moves(int currentPosition) {
-    int row = currentPosition / 8;
-    int col = currentPosition % 8;
-    int r, c;
-    int64_t bitMask;
-    int64_t upRight = 0;
-    int64_t upLeft = 0;
-    int64_t downRight = 0;
-    int64_t downLeft = 0;
-    int64_t* sameColor[6];
-    int64_t* differentColor[6];
+    int64_t ans = 0;
+    int64_t sameColor;
+    int64_t differentColor;
+    whiteTurn ? sameColor = white_pieces : sameColor = black_pieces;
+    whiteTurn ? differentColor = black_pieces : differentColor = white_pieces;
 
-    int64_t same;
-    int64_t different;
+    //handle nE
+    int64_t northEastOccupied = nE[currentPosition] & (black_pieces | white_pieces);
+    if (northEastOccupied == 0) {
+        ans |= nE[currentPosition];
+    } else {
+        int index = __builtin_ctzll(northEastOccupied);
+        ans |= northEastOccupied ^ nE[currentPosition];
 
-    whiteTurn ? copy(begin(whiteBitboards), end(whiteBitboards), begin(sameColor)) : copy(begin(blackBitboards), end(blackBitboards), begin(sameColor));
-    whiteTurn ? copy(begin(blackBitboards), end(blackBitboards), begin(differentColor)) : copy(begin(whiteBitboards), end(whiteBitboards), begin(differentColor));
-
-    whiteTurn ? same = white_pieces : same = black_pieces;
-    whiteTurn ? different = black_pieces : different = white_pieces;
-
-    // Up and right captures
-    r = row;
-    c = col;
-    bool upRightFound = false;
-    bool sameColorUpRight = false;
-    while (r > 0 && c < 7) {
-        r--;
-        c++;
-        bitMask = 1ULL << (r * 8 + c);
-        upRight |= bitMask;
-        if (bitMask & different) {
-            upRightFound = true;
-            break;
-        } else if (bitMask & same) {
-            sameColorUpRight = true;
-            bitMask = ~bitMask;
-            upRight &= bitMask;
-            break;
+        if (differentColor & northEastOccupied) {
+            ans |= 1ULL << index;
         }
     }
 
-    // Up and left captures
-    r = row;
-    c = col;
-    bool upLeftFound = false;
-    bool sameColorUpLeft = false;
-    while (r > 0 && c > 0) {
-        r--;
-        c--;
-        int i = r * 8 + c;
-        bitMask = 1ULL << i;
-        upLeft |= bitMask;
-        if (bitMask & different) {
-            upLeftFound = true;
-            break;
-        } else if (bitMask & same) {
-            sameColorUpLeft = true;
-            bitMask = ~bitMask;
-            upLeft &= bitMask;
-            break;
+    //handle nW
+    int64_t northWestOccupied = nW[currentPosition] & (black_pieces | white_pieces);
+    if (northWestOccupied == 0) {
+        ans |= nW[currentPosition];
+    } else {
+        int index = __builtin_ctzll(northWestOccupied);
+        ans |= northWestOccupied ^ nW[currentPosition];
+
+        if (differentColor & northWestOccupied) {
+            ans |= 1ULL << index;
         }
     }
 
-    // Down and right captures
-    r = row;
-    c = col;
-    bool downRightFound = false;
-    bool sameColorDownRight = false;
-    while (r < 7 && c < 7) {
-        r++;
-        c++;
-        int i = r * 8 + c;
-        bitMask = 1ULL << i;
-        downRight |= bitMask;
-        if (bitMask & different) {
-            downRightFound = true;
-            break;
-        } else if (bitMask & same) {
-            sameColorDownRight = true;
-            bitMask = ~bitMask;
-            downRight &= bitMask;
-            break;
+    //handle sE
+    int64_t southEastOccupied = sE[currentPosition] & (black_pieces | white_pieces);
+    if (southEastOccupied == 0) {
+        ans |= sE[currentPosition];
+    } else {
+        int index = __builtin_ctzll(southEastOccupied);
+        ans |= southEastOccupied ^ sE[currentPosition];
+
+        if (differentColor & southEastOccupied) {
+            ans |= 1ULL << index;
         }
     }
 
-    // Down and left captures
-    r = row;
-    c = col;
-    bool downLeftFound = false;
-    bool sameColorDownLeft = false;
-    while (r < 7 && c > 0) {
-        r++;
-        c--;
-        int i = r * 8 + c;
-        bitMask = 1ULL << i;
-        downLeft |= bitMask;
-        if (bitMask & different) {
-            downLeftFound = true;
-            break;
-        } else if (bitMask & same) {
-            sameColorDownLeft = true;
-            bitMask = ~bitMask;
-            downLeft &= bitMask;
-            break;
+    //handle sW
+    int64_t southWestOccupied = sW[currentPosition] & (black_pieces | white_pieces);
+    if (southWestOccupied == 0) {
+        ans |= sW[currentPosition];
+    } else {
+        int index = __builtin_ctzll(southWestOccupied);
+        ans |= southWestOccupied ^ sW[currentPosition];
+
+        if (differentColor & southWestOccupied) {
+            ans |= 1ULL << index;
         }
     }
-
-    return upRight | upLeft | downRight | downLeft;
+    
+    return ans;
 }
 
 int64_t MoveGeneration::generate_sideways_moves(int currentPosition) {
-    int row = currentPosition / 8;
-    int col = currentPosition % 8;
-    int r, c;
-    int64_t bitMask;
-    int64_t up = 0;
-    int64_t down = 0;
-    int64_t left = 0;
-    int64_t right = 0;
-    int64_t* sameColor[6];
-    int64_t* differentColor[6];
-    int64_t same;
-    int64_t different;
+    int64_t ans = 0;
+    int64_t sameColor;
+    int64_t differentColor;
+    whiteTurn ? sameColor = white_pieces : sameColor = black_pieces;
+    whiteTurn ? differentColor = black_pieces : differentColor = white_pieces;
 
-    whiteTurn ? same = white_pieces : same = black_pieces;
-    whiteTurn ? different = black_pieces : different = white_pieces;
-    whiteTurn ? copy(begin(whiteBitboards), end(whiteBitboards), begin(sameColor)) : copy(begin(blackBitboards), end(blackBitboards), begin(sameColor));
-    whiteTurn ? copy(begin(blackBitboards), end(blackBitboards), begin(differentColor)) : copy(begin(whiteBitboards), end(whiteBitboards), begin(differentColor));
+    //handle n
+    int64_t northOccupied = n[currentPosition] & (black_pieces | white_pieces);
+    if (northOccupied == 0) {
+        ans |= n[currentPosition];
+    } else {
+        int index = __builtin_ctzll(northOccupied);
+        ans |= northOccupied ^ n[currentPosition];
 
-    //up
-    r = row+1;
-    c = col;
-    bool upFound = false;
-    bool upSameFound = false;
-    while (r <= 7) {
-        bitMask = 1ULL << (r * 8 + c);
-        up |= bitMask;
-        if (same & bitMask) {
-            upSameFound = true;
-            bitMask = ~bitMask;
-            up &= bitMask;
-            break;
-        } else if (different & bitMask) {
-            upFound = true;
-            break;
+        if (differentColor & northOccupied) {
+            ans |= 1ULL << index;
         }
-        r++;
     }
 
-    //down
-    r = row-1;
-    c = col;
-    bool downFound = false;
-    bool downSameFound = false;
-    while (r >= 0) {
-        bitMask = 1ULL << (r * 8 + c);
-        down |= bitMask;
-        if (same & bitMask){
-            downSameFound = true;
-            bitMask = ~bitMask;
-            down &= bitMask;
-            break;
-        } else if (different & bitMask) {
-            downFound = true;
-            break;
+    //handle s
+    int64_t southOccupied = s[currentPosition] & (black_pieces | white_pieces);
+    if (southOccupied == 0) {
+        ans |= s[currentPosition];
+    } else {
+        int index = __builtin_ctzll(southOccupied);
+        ans |= southOccupied ^ s[currentPosition];
+
+        if (differentColor & southOccupied) {
+            ans |= 1ULL << index;
         }
-        r--;
     }
 
-    //right
-    r = row;
-    c = col-1;
-    bool rightFound = false;
-    bool rightSameFound = false;
-    while (c >= 0) {
-        bitMask = 1ULL << (r * 8 + c);
-        right |= bitMask;
-        if (same & bitMask){
-            rightSameFound = true;
-            bitMask = ~bitMask;
-            right &= bitMask;
-            break;
-        } else if (different & bitMask) {
-            rightFound = true;
-            break;
+    //handle e
+    int64_t eastOccupied = e[currentPosition] & (black_pieces | white_pieces);
+    if (eastOccupied == 0) {
+        ans |= e[currentPosition];
+    } else {
+        int index = __builtin_ctzll(eastOccupied);
+        ans |= eastOccupied ^ e[currentPosition];
+
+        if (differentColor & eastOccupied) {
+            ans |= 1ULL << index;
         }
-        c--;
     }
 
-    //right
-    r = row;
-    c = col+1;
-    bool leftFound = false;
-    bool leftSameFound = false;
-    while (c <= 7) {
-        bitMask = 1ULL << (r * 8 + c);
-        left |= bitMask;
-        if (same & bitMask){
-            leftSameFound = true;
-            bitMask = ~bitMask;
-            left &= bitMask;
-            break;
-        } else if (different & bitMask) {
-            leftFound = true;
-            break;
+    //handle w
+    int64_t westOccupied = w[currentPosition] & (black_pieces | white_pieces);
+    if (westOccupied == 0) {
+        ans |= w[currentPosition];
+    } else {
+        int index = __builtin_ctzll(westOccupied);
+        ans |= westOccupied ^ w[currentPosition];
+
+        if (differentColor & westOccupied) {
+            ans |= 1ULL << index;
         }
-        c++;
     }
 
-    return (up | down | left | right) & ~(1ULL << currentPosition);
+    return ans;
 }
 
 int64_t MoveGeneration::generate_knight_moves(int currentPosition) {
@@ -1136,35 +1134,29 @@ int MoveGeneration::count_moves(int depth) {
     return count;
 }
 
+/*
+int board[8][8] = {
+    {63, 62, 61, 60, 59, 58, 57, 56},
+    {55, 54, 53, 52, 51, 50, 49, 48},
+    {47, 46, 45, 44, 43, 42, 41, 40},
+    {39, 38, 37, 36, 35, 34, 33, 32},
+    {31, 30, 29, 28, 27, 26, 25, 24},
+    {23, 22, 21, 20, 19, 18, 17, 16},
+    {15, 14, 13, 12, 11, 10,  9,  8},
+    {7,   6,  5,  4,  3,  2,  1,  0}
+};
+*/
+
 int main() {
     MoveGeneration thing;
-    thing.whiteTurn = true;
+    thing.initialize_rays();
 
-    thing.set_fen("rnbq1k1r/pp1Pbppp/2p5/8/2B5/8/PPP1NnPP/RNBQK2R");
-    thing.whiteKingMoved = false;
-    thing.blackKingMoved = false;
+    print_board(thing.generate_diagonal_moves(44));
 
-    print_board(thing.check_checker());
-
-    cout << "-------------" << endl;
     auto start = high_resolution_clock::now();
-    vector<Move> thang = thing.generate_all_moves();
-    //vector<int> thang = all_set_bits(universal);
+    thing.attacked_by(44);
     auto stop = high_resolution_clock::now();
     auto duration = duration_cast<microseconds>(stop - start);
-    cout << "DURATION: " << duration.count() << endl;
-    cout << thang.size() << endl;
-    for (Move move : thang) {
-        cout << move.before << " " << move.after << " " << move.castle << " " << move.piece << endl;
-    }
-
-    cout << "-------------" << endl;
-    start = high_resolution_clock::now();
-    int count = thing.count_moves(4);
-    stop = high_resolution_clock::now();
-    duration = duration_cast<microseconds>(stop - start);
-    cout << "DURATION: " << duration.count() << endl;
-    cout << count << endl;
-
+    cout << duration.count() << endl;
     return 0;
 }

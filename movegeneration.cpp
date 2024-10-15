@@ -1,4 +1,5 @@
 #include <iostream>
+#include <string>
 #include <bitset>
 #include <cstdint>
 #include <chrono>
@@ -7,6 +8,7 @@
 #include <map>
 #include <array>
 #include <cmath>
+#include <sstream>
 //#include "chess.h"
 
 /*
@@ -17,7 +19,8 @@ a way of doing that is maybe to precalculate them somehow? the problem with my g
 2. Implement a function that generates all possible moves for a given board state
 3. Refactor all code to optimize for speed
 4. Implement a massive hash table so I don't search similar branches?
-5. THEN, work on evaluation function
+5. Magic bitboards?
+6. THEN, work on evaluation function
 */
 
 /*
@@ -52,10 +55,13 @@ class Move {
     public: 
         int before;
         int after;
+        //piece that the pawn was promoted to
         int promotion;
+        //square the rook moved to
         int castle;
         pieces piece;
-        pieces captured_piece;
+        int captured_piece;
+
         bool whiteKingMoved;
         bool blackKingMoved;
         bool whiteHCastle;
@@ -106,6 +112,10 @@ class MoveGeneration {
         int64_t s[64];
         int64_t e[64];
         int64_t w[64];
+        int64_t knightMoves[64];
+        int64_t kingMoves[64];
+        int64_t blackPawnLookup[64];
+        int64_t whitePawnLookup[64];
         
         bool whiteTurn;
         bool whiteKingMoved;
@@ -120,6 +130,7 @@ class MoveGeneration {
         int64_t generate_sideways_moves(int);
         int64_t generate_knight_moves(int);
         int64_t pawn_moves(int);
+        int64_t every_pinned_piece();
         int64_t isPinned(int, pieces);
         int64_t attacked_by(int);
         int64_t castle_condition();
@@ -127,9 +138,10 @@ class MoveGeneration {
         int64_t check_checker();
         int count_moves(int);
         void make_move(Move);
+        void set_state(Move&);
         void undo_move(Move);
         void set_fen(string);
-        void initialize_rays();
+        void initialize_lookup_table();
         bool empty_square(int);
         vector<Move> bitboard_to_moves(int64_t, int, pieces);
         vector<Move> generate_all_moves();
@@ -169,14 +181,14 @@ class MoveGeneration {
 
 int64_t eastOne (int64_t b) {return (b << 1) & 0xfefefefefefefefe;}
 int64_t westOne (int64_t b) {return (b >> 1) & 0x7f7f7f7f7f7f7f7f;}
+uint64_t northOne(uint64_t b) { return (b << 8); }
+uint64_t southOne(uint64_t b) { return (b >> 8); }
 
 void move_bit(int64_t* val, int oldPos, int newPos) {
-    int64_t mask = 1ULL << oldPos;   // Create mask for the bit at oldPos
-    mask <<= newPos - oldPos;        // Shift the bit to newPos
-
-    *val |= mask;                    // Set the bit at newPos
-    mask = ~(1ULL << oldPos);        // Create a mask to clear the bit at oldPos
-    *val &= mask;                    // Clear the bit at oldPos
+    // Clear the bit at oldPos
+    *val &= ~(1ULL << oldPos);
+    // Set the bit at newPos
+    *val |= 1ULL << newPos;
 }
 
 /*
@@ -231,6 +243,50 @@ void print_board(int64_t bitboard) {
     }
 }
 
+void print_all_board(MoveGeneration& game) {
+    // Initialize the board with empty squares
+    char board[64];
+    for (int i = 0; i < 64; ++i) {
+        board[i] = '.';
+    }
+
+    // Map pieces to characters
+    char piece_chars[6] = {'P', 'N', 'B', 'R', 'Q', 'K'};
+
+    // White pieces
+    for (int i = 0; i < 6; ++i) {
+        uint64_t bitboard = *game.whiteBitboards[i];
+        while (bitboard) {
+            int pos = __builtin_ctzll(bitboard);
+            board[pos] = piece_chars[i];
+            bitboard &= bitboard - 1;
+        }
+    }
+
+    // Black pieces
+    for (int i = 0; i < 6; ++i) {
+        uint64_t bitboard = *game.blackBitboards[i];
+        while (bitboard) {
+            int pos = __builtin_ctzll(bitboard);
+            board[pos] = tolower(piece_chars[i]);
+            bitboard &= bitboard - 1;
+        }
+    }
+
+    // Print the board
+    std::cout << "  +---+---+---+---+---+---+---+---+\n";
+    for (int rank = 7; rank >= 0; --rank) {
+        std::cout << rank + 1 << " | ";
+        for (int file = 7; file >= 0; --file) {  // Reverse file indexing
+            int idx = rank * 8 + file;  // Adjust index calculation
+            std::cout << board[idx] << " | ";
+        }
+        std::cout << "\n  +---+---+---+---+---+---+---+---+\n";
+    }
+    std::cout << "    h   g   f   e   d   c   b   a\n";  // Adjust file labels
+}
+
+
 /*
 int board[8][8] = {
     {63, 62, 61, 60, 59, 58, 57, 56},
@@ -244,7 +300,7 @@ int board[8][8] = {
 };
 */
 
-void MoveGeneration::initialize_rays(){
+void MoveGeneration::initialize_lookup_table(){
     int64_t northWest;
     int64_t northEast;
     int64_t southWest;
@@ -300,8 +356,48 @@ void MoveGeneration::initialize_rays(){
             sE[r8 - f] = souea;
         }
     }
+
+    //handle knight lookup table
+    int64_t moves, curr;
+    for (int i = 0; i < 64; i++) {
+        moves = 0;
+        curr = 1ULL << i;
+
+        moves |= northOne(northOne(eastOne(curr)));  // Two north, one east
+        moves |= northOne(northOne(westOne(curr)));  // Two north, one west
+        moves |= southOne(southOne(eastOne(curr)));  // Two south, one east
+        moves |= southOne(southOne(westOne(curr)));  // Two south, one west
+        moves |= eastOne(eastOne(northOne(curr)));   // Two east, one north
+        moves |= eastOne(eastOne(southOne(curr)));   // Two east, one south
+        moves |= westOne(westOne(northOne(curr)));   // Two west, one north
+        moves |= westOne(westOne(southOne(curr)));   // Two west, one south
+
+        knightMoves[i] = moves;
+    }
+
+    //king lookup table
+    for (int i = 0; i < 64; i++) {
+        moves = 0;
+        curr = 1ULL << i;
+
+        moves |= eastOne(curr);
+        moves |= westOne(curr);
+        moves |= northOne(curr);
+        moves |= southOne(curr);
+        moves |= eastOne(northOne(curr));
+        moves |= westOne(northOne(curr));
+        moves |= eastOne(southOne(curr));
+        moves |= westOne(southOne(curr));
+
+        kingMoves[i] = moves;
+    }
 }
 
+int bitscan_reverse(int64_t x) {
+    return 63 - __builtin_clzll(x);
+}
+
+//BUGGY
 int64_t MoveGeneration::generate_diagonal_moves(int currentPosition) {
     int64_t ans = 0;
     int64_t sameColor;
@@ -315,10 +411,11 @@ int64_t MoveGeneration::generate_diagonal_moves(int currentPosition) {
         ans |= nE[currentPosition];
     } else {
         int index = __builtin_ctzll(northEastOccupied);
-        ans |= northEastOccupied ^ nE[currentPosition];
+        ans |= nE[currentPosition];
+        ans &= ~(nE[index]);
 
-        if (differentColor & northEastOccupied) {
-            ans |= 1ULL << index;
+        if (sameColor & (1ULL << index)) {
+            ans &= ~(1ULL << index);
         }
     }
 
@@ -328,10 +425,11 @@ int64_t MoveGeneration::generate_diagonal_moves(int currentPosition) {
         ans |= nW[currentPosition];
     } else {
         int index = __builtin_ctzll(northWestOccupied);
-        ans |= northWestOccupied ^ nW[currentPosition];
+        ans |= nW[currentPosition];
+        ans &= ~(nW[index]);
 
-        if (differentColor & northWestOccupied) {
-            ans |= 1ULL << index;
+        if (sameColor & (1ULL << index)) {
+            ans &= ~(1ULL << index);
         }
     }
 
@@ -340,11 +438,12 @@ int64_t MoveGeneration::generate_diagonal_moves(int currentPosition) {
     if (southEastOccupied == 0) {
         ans |= sE[currentPosition];
     } else {
-        int index = __builtin_ctzll(southEastOccupied);
-        ans |= southEastOccupied ^ sE[currentPosition];
+        int index = bitscan_reverse(southEastOccupied);
+        ans |= sE[currentPosition];
+        ans &= ~(sE[index]);
 
-        if (differentColor & southEastOccupied) {
-            ans |= 1ULL << index;
+        if (sameColor & (1ULL << index)) {
+            ans &= ~(1ULL << index);
         }
     }
 
@@ -353,11 +452,12 @@ int64_t MoveGeneration::generate_diagonal_moves(int currentPosition) {
     if (southWestOccupied == 0) {
         ans |= sW[currentPosition];
     } else {
-        int index = __builtin_ctzll(southWestOccupied);
-        ans |= southWestOccupied ^ sW[currentPosition];
+        int index = bitscan_reverse(southWestOccupied);
+        ans |= sW[currentPosition];
+        ans &= ~(sW[index]);
 
-        if (differentColor & southWestOccupied) {
-            ans |= 1ULL << index;
+        if (sameColor & (1ULL << index)) {
+            ans &= ~(1ULL << index);
         }
     }
     
@@ -377,36 +477,11 @@ int64_t MoveGeneration::generate_sideways_moves(int currentPosition) {
         ans |= n[currentPosition];
     } else {
         int index = __builtin_ctzll(northOccupied);
-        ans |= northOccupied ^ n[currentPosition];
+        ans |= n[currentPosition];
+        ans &= ~(n[index]);
 
-        if (differentColor & northOccupied) {
-            ans |= 1ULL << index;
-        }
-    }
-
-    //handle s
-    int64_t southOccupied = s[currentPosition] & (black_pieces | white_pieces);
-    if (southOccupied == 0) {
-        ans |= s[currentPosition];
-    } else {
-        int index = __builtin_ctzll(southOccupied);
-        ans |= southOccupied ^ s[currentPosition];
-
-        if (differentColor & southOccupied) {
-            ans |= 1ULL << index;
-        }
-    }
-
-    //handle e
-    int64_t eastOccupied = e[currentPosition] & (black_pieces | white_pieces);
-    if (eastOccupied == 0) {
-        ans |= e[currentPosition];
-    } else {
-        int index = __builtin_ctzll(eastOccupied);
-        ans |= eastOccupied ^ e[currentPosition];
-
-        if (differentColor & eastOccupied) {
-            ans |= 1ULL << index;
+        if (sameColor & 1ULL << index) {
+            ans &= ~(1ULL << index);
         }
     }
 
@@ -416,10 +491,41 @@ int64_t MoveGeneration::generate_sideways_moves(int currentPosition) {
         ans |= w[currentPosition];
     } else {
         int index = __builtin_ctzll(westOccupied);
-        ans |= westOccupied ^ w[currentPosition];
+        ans |= w[currentPosition];
+        ans &= ~(w[index]);
 
-        if (differentColor & westOccupied) {
-            ans |= 1ULL << index;
+        if (sameColor & 1ULL << index) {
+            ans &= ~(1ULL << index);
+        }
+    }
+
+    //handle s
+    int64_t southOccupied = s[currentPosition] & (black_pieces | white_pieces);
+    if (southOccupied == 0) {
+        ans |= s[currentPosition];
+    } else {
+        int index = bitscan_reverse(southOccupied);
+        cout << "INDEX: " << index << endl;
+        ans |= s[currentPosition];
+        ans &= ~(s[index]);
+
+        if (sameColor & 1ULL << index) {
+            ans &= ~(1ULL << index);
+        }
+    }
+
+    //handle e
+    int64_t eastOccupied = e[currentPosition] & (black_pieces | white_pieces);
+    if (eastOccupied == 0) {
+        ans |= e[currentPosition];
+    } else {
+        int index = bitscan_reverse(eastOccupied);
+        cout << "INDEX: " << index << endl;
+        ans |= e[currentPosition];
+        ans &= ~(e[index]);
+
+        if (sameColor & 1ULL << index) {
+            ans &= ~(1ULL << index);
         }
     }
 
@@ -427,45 +533,14 @@ int64_t MoveGeneration::generate_sideways_moves(int currentPosition) {
 }
 
 int64_t MoveGeneration::generate_knight_moves(int currentPosition) {
-    int knightShifts[8][2] = {{2, -1}, {2, 1}, {1, -2}, {1, 2}, {-1, -2}, {-1, 2}, {-2, 1}, {-2, -1}};
-    int64_t bitMask = 0;
-    int64_t* sameColor[6];
-    int64_t ans = 0;
+    int64_t knightMovement = knightMoves[currentPosition];
+    int64_t sameSidePieces;
 
-    int row = currentPosition / 8;
-    int col = currentPosition % 8;
+    whiteTurn ? sameSidePieces = white_pieces : sameSidePieces = black_pieces;
 
-    if (whiteTurn) {
-        copy(begin(whiteBitboards), end(whiteBitboards), begin(sameColor));
-    } else {
-        copy(begin(blackBitboards), end(blackBitboards), begin(sameColor));
-    }
+    knightMovement ^= sameSidePieces & knightMovement;
 
-    for (int i = 0; i < sizeof(knightShifts) / sizeof(knightShifts[0]); ++i) {
-        int newRow = row + knightShifts[i][0];
-        int newCol = col + knightShifts[i][1];
-
-        if (newRow < 0 || newRow > 7 || newCol < 0 || newCol > 7) {
-            continue;
-        }
-
-        int curr = newRow * 8 + newCol;
-        bitMask = 1ULL << curr;
-
-        bool isSameColor = false;
-        for (int j = 0; j < 6; ++j) {
-            if (*sameColor[j] & bitMask) {
-                isSameColor = true;
-                break;
-            }
-        }
-
-        if (!isSameColor) {
-            ans |= bitMask;
-        }
-    }
-
-    return ans;
+    return knightMovement;
 }
 
 int64_t MoveGeneration::pawn_moves(int currentPosition) {
@@ -525,24 +600,82 @@ int64_t MoveGeneration::pawn_moves(int currentPosition) {
     return ans;
 }
 
+bool multiple_set_bits(int64_t x) {
+    return x & (x - 1);
+}
+
+int64_t MoveGeneration::every_pinned_piece() {
+    int kingLocation;
+    int64_t sameSide, opponentSide, queens, rooks, bishops, samePawns, enemyPawns;
+    int64_t ans = 0;
+
+    whiteTurn ? kingLocation = __builtin_ffsll(white_king) - 1 : kingLocation = __builtin_ffsll(black_king) - 1;
+    whiteTurn ? sameSide = white_pieces : sameSide = black_pieces;
+    whiteTurn ? opponentSide = black_pieces : opponentSide = white_pieces;
+    whiteTurn ? queens = black_queens : queens = white_queens;
+    whiteTurn ? rooks = black_rooks : rooks = white_rooks;
+    whiteTurn ? bishops = black_bishops : bishops = white_bishops;
+    whiteTurn ? samePawns = white_pawns : samePawns = black_pawns;
+    whiteTurn ? enemyPawns = black_pawns : enemyPawns = white_pawns;
+
+    int64_t north, south, east, west, northEast, northWest, southEast, southWest;
+
+    north = n[kingLocation];
+    south = s[kingLocation];
+    east = e[kingLocation];
+    west = w[kingLocation];
+    northEast = nE[kingLocation];
+    northWest = nW[kingLocation];
+    southEast = sE[kingLocation];
+    southWest = sW[kingLocation];
+    
+    int64_t attackers = 0;
+    int attacker_index;
+
+    attackers = west & (rooks | queens);
+    attacker_index = __builtin_ctzll(attackers);
+    if (attackers) {
+        int64_t same_ray = (west & e[attacker_index]) & (sameSide | opponentSide);
+        same_ray &= ~(1ULL << attacker_index);
+
+        if (!multiple_set_bits(same_ray) && (same_ray & sameSide)) {
+            ans |= same_ray;
+        }
+
+        //handle en passant pin
+        int64_t relevantPawns = samePawns & west;
+        
+    }
+
+    attackers = east & (rooks | queens);
+    attacker_index = __builtin_ctzll(attackers);
+    if (attackers) {
+        int64_t same_ray = (east & w[attacker_index]) & (sameSide | opponentSide);
+        same_ray &= ~(1ULL << attacker_index);
+
+        if (!multiple_set_bits(same_ray) && (same_ray & sameSide)) {
+            ans |= same_ray;
+        }
+    }
+
+    return ans;
+}
+
+//MAKE SURE EN PASSANT IS TAKEN INTO ACCOUNT
 int64_t MoveGeneration::isPinned(int currentPosition, pieces pieceType) {
     int kingLocation;
     int dr; //+1, -1, 0
     int dc; //+1, -1, 0
-    bool up;
-    bool right;
-    bool straight;
-    bool diagonal;
-    int64_t* sameColor[6];
-    int64_t* differentColor[6];
+    int64_t sameColor;
+    int64_t differentColor;
 
     if (whiteTurn) {
-        copy(begin(whiteBitboards), end(whiteBitboards), begin(sameColor));
-        copy(begin(blackBitboards), end(blackBitboards), begin(differentColor));
+        sameColor = white_pieces;
+        differentColor = black_pieces;
         kingLocation = __builtin_ffsll(white_king) - 1;
     } else {
-        copy(begin(blackBitboards), end(blackBitboards), begin(sameColor));
-        copy(begin(whiteBitboards), end(whiteBitboards), begin(differentColor));
+        sameColor = black_pieces;
+        differentColor = white_pieces;
         kingLocation = __builtin_ffsll(black_king) - 1;
     }
 
@@ -550,6 +683,7 @@ int64_t MoveGeneration::isPinned(int currentPosition, pieces pieceType) {
     int positionCol = 7 - currentPosition % 8;
     int kingRow = kingLocation / 8;
     int kingCol = 7 - kingLocation % 8;
+    int64_t ray;
 
     if (abs(kingRow - positionRow) == abs(kingCol - positionCol)) {
         kingRow > positionRow ? dr = -1 : dr = 1;
@@ -564,42 +698,28 @@ int64_t MoveGeneration::isPinned(int currentPosition, pieces pieceType) {
         return universal;
     }
 
-    int r = kingRow + dr;
-    int c = kingCol + dc;
-    int curr = r * 8 + (7 - c);
-    int64_t ans = 0;
-    bool foundSelf = false;
-
-    while (r <= 7 && c <= 7 && r >= 0 && c >= 0) {
-        if (r == positionRow && c == positionCol) {
-            foundSelf = true;
-            r+=dr;
-            c+=dc;
-            curr = r * 8 + (7 - c);
-            continue;
-        } 
-        for (int i = 0; i < 6; i++) {
-            if ((*sameColor[i] & 1ULL << curr) || (!foundSelf && (*differentColor[i] & 1ULL << curr))) {
-                return universal;
-            } else if (foundSelf && (*differentColor[i] & 1ULL << curr)) {
-                if ((i == 2 || i == 4) && dr != 0 && dc != 0) {
-                    //diagonal
-                    ans |= 1ULL << curr;
-                    return ans;
-                } else if ((i == 3 || i == 4) && (dr != 0 || dc != 0)) {
-                    ans |= 1ULL << curr;
-                    return ans;
-                } else {
-                    return universal;
-                }
-            }
-            ans |= 1ULL << curr;
+    
+    if (dr == 0) {
+        //horizontal
+        dc > 0 ? ray = e[kingLocation] : ray = w[kingLocation];
+    } else if (dc == 0) {
+        dr > 0 ? ray = n[kingLocation] : ray = s[kingLocation];
+    } else {
+        //diagonal
+        if (dr > 0 && dc > 0) {
+            ray = nE[kingLocation];
+        } else if (dr > 0 && dc < 0) {
+            ray = nW[kingLocation];
+        } else if (dr < 0 && dc > 0) {
+            ray = sE[kingLocation];
+        } else {
+            ray = sW[kingLocation];
         }
-        r += dr;
-        c += dc;
-        curr = r * 8 + (7 - c);
     }
-    return universal;
+
+    //print_board(ray);
+
+    return ray;
 }
 
 void timeFunction(int currentPosition, int64_t (*func)()) {
@@ -611,6 +731,7 @@ void timeFunction(int currentPosition, int64_t (*func)()) {
     cout << duration.count() << endl;
 }
 
+//REFACTOR
 int64_t MoveGeneration::attacked_by(int currentPosition) {
     int64_t* differentColor[6];
     int kingLocation;
@@ -621,21 +742,6 @@ int64_t MoveGeneration::attacked_by(int currentPosition) {
     whiteTurn ? copy(begin(blackBitboards), end(blackBitboards), begin(differentColor)) : copy(begin(whiteBitboards), end(whiteBitboards), begin(differentColor));
     whiteTurn ? kingLocation = __builtin_ffsll(white_king) - 1 : kingLocation = __builtin_ffsll(black_king) - 1;
     
-    int64_t kingMoves = 0;
-
-    for (int i = 0; i < 8; ++i) {
-        int newRow = row + kingShifts[i][0];
-        int newCol = col + kingShifts[i][1];
-
-        if (newRow < 0 || newRow > 7 || newCol < 0 || newCol > 7) {
-            continue; // Out of bounds
-        }
-
-        int curr = newRow * 8 + newCol;
-        int64_t bitMask = 1ULL << curr;
-        kingMoves |= bitMask;
-    }
-
     int64_t diagonals = generate_diagonal_moves(currentPosition);
     int64_t sideways = generate_sideways_moves(currentPosition);
 
@@ -644,9 +750,10 @@ int64_t MoveGeneration::attacked_by(int currentPosition) {
         |   (generate_knight_moves(currentPosition) & *differentColor[1])
         |   (sideways & *differentColor[3])
         |  (pawn_moves(currentPosition) & *differentColor[0])
-        |   (kingMoves & *differentColor[5]);
+        |   (kingMoves[currentPosition] & *differentColor[5]);
 }
 
+//POTENTIALLY REFACTOR BECAUSE ATTACKED BY IS USED SO MUCH
 int64_t MoveGeneration::castle_condition() {
     int64_t ans = 0;
 
@@ -655,12 +762,12 @@ int64_t MoveGeneration::castle_condition() {
             return 0;
         }
 
-        if (!(!whiteHCastle || attacked_by(2) || attacked_by(1)) && (empty_square(2) && empty_square(1))) {;
+        if (!(!whiteHCastle || attacked_by(2) || attacked_by(1))) {;
             ans |= 1ULL << 1;
             
         }
 
-        if (!(!whiteACastle || attacked_by(5) || attacked_by(4)) && (empty_square(5) && empty_square(4))) {
+        if (!(!whiteACastle || attacked_by(5) || attacked_by(4))) {
             ans |= 1ULL << 5;
         }
     } else {
@@ -668,17 +775,18 @@ int64_t MoveGeneration::castle_condition() {
             return 0;
         }
 
-        if (!(!blackHCastle || attacked_by(58) || attacked_by(57)) && (empty_square(58) && empty_square(57))) {
+        if (!(!blackHCastle || attacked_by(58) || attacked_by(57))) {
             ans |= 1ULL << 57;
         }
 
-        if (!(!blackACastle || attacked_by(61) || attacked_by(60)) && (empty_square(61) && empty_square(60))) {
+        if (!(!blackACastle || attacked_by(61) || attacked_by(60))) {
             ans |= 1ULL << 61;
         }
     }
-    return ans;
+    return ans & ~(black_pieces | white_pieces);
 }
 
+//REFACTOR
 int64_t MoveGeneration::king_moves(int currentPosition) {
     int kingShifts[8][2] = {{0, -1}, {0, 1}, {1, 0}, {-1, 0}, {1, 1}, {-1, -1}, {-1, 1}, {1, -1}};
     int64_t ans = 0;
@@ -718,6 +826,7 @@ int64_t MoveGeneration::king_moves(int currentPosition) {
     return ans;
 }
 
+//REFACTOR, MAKE MORE LIKE ISPINNED AND HAVE IT DIRECT A RAY FROM THE KING TO THE ATTACKER
 int64_t MoveGeneration::check_checker() {
     int kingLocation;
     int dr; //+1, -1, 0
@@ -792,13 +901,17 @@ int64_t MoveGeneration::check_checker() {
 void MoveGeneration::make_move(Move move) {
     if (!(1ULL << 0 & white_rooks)) {
         whiteHCastle = false;
-    } else if (!(1ULL << 7 & white_rooks)) {
+    }
+    if (!(1ULL << 7 & white_rooks)) {
         whiteACastle = false;
-    } else if (!(1ULL << 56 & black_rooks)) {
+    }
+    if (!(1ULL << 56 & black_rooks)) {
         blackHCastle = false;
-    } else if (!(1ULL << 63 & black_rooks)) {
+    }
+    if (!(1ULL << 63 & black_rooks)) {
         blackACastle = false;
     }
+
     
     if (whiteTurn) {
         if (move.piece == 3) {
@@ -887,9 +1000,76 @@ void MoveGeneration::make_move(Move move) {
     whiteTurn = !whiteTurn;
 }
 
-void MoveGeneration::undo_move(Move move) {
-    if (whiteTurn) {
+void MoveGeneration::set_state(Move& move) {
+    move.enPassantSquare = enPassantSquare;
+    move.whiteKingMoved = whiteKingMoved;
+    move.blackKingMoved = blackKingMoved;
+    move.whiteHCastle = whiteHCastle;
+    move.whiteACastle = whiteACastle;
+    move.blackACastle = blackACastle;
+    move.blackHCastle = blackHCastle;
+}
 
+void MoveGeneration::undo_move(Move move) {
+    //helper info
+    /*
+        int before;
+        int after;
+        int promotion;
+        int castle;
+        pieces piece;
+        pieces captured_piece;
+    */
+
+    //reload the past board state
+    whiteTurn = !whiteTurn;
+    enPassantSquare = move.enPassantSquare;
+    whiteKingMoved = move.whiteKingMoved;
+    blackKingMoved = move.blackKingMoved;
+    whiteHCastle = move.whiteHCastle;
+    whiteACastle = move.whiteACastle;
+    blackACastle = move.blackACastle;
+    blackHCastle = move.blackHCastle;
+
+    //return the piece to where it needs to be
+    if (whiteTurn) {
+        if (move.castle != -1) {
+            if (move.castle == 2) {
+                move_bit(whiteBitboards[ROOK], 2, 0);
+            } else {
+                move_bit(whiteBitboards[ROOK], 4, 7);
+            }
+        }
+
+        //unset if it was a promotion
+        if (move.promotion != -1) {
+            *whiteBitboards[move.promotion] &= ~(1ULL << move.after);
+            *whiteBitboards[move.piece] |= (1ULL << move.before);
+        } else {
+            move_bit(whiteBitboards[move.piece], move.after, move.before);  
+        }
+        if (move.captured_piece != -1) {
+            *blackBitboards[move.captured_piece] |= 1ULL << move.after;
+        }
+    } else {
+        if (move.castle != -1) {
+            if (move.castle == 58) {
+                move_bit(blackBitboards[ROOK], 58, 56);
+            } else {
+                move_bit(blackBitboards[ROOK], 60, 63);
+            }
+        }
+
+        //unset if it was a promotion
+        if (move.promotion != -1) {
+            *blackBitboards[move.promotion] &= ~(1ULL << move.after);
+            *blackBitboards[move.piece] |= (1ULL << move.before);
+        } else {
+            move_bit(blackBitboards[move.piece], move.after, move.before);
+        }
+        if (move.captured_piece != -1) {
+            *whiteBitboards[move.captured_piece] |= 1ULL << move.after;
+        }
     }
 }
 
@@ -914,18 +1094,59 @@ void MoveGeneration::set_fen(string fen) {
     black_queens = 0;
     black_king = 0;
 
-    for (int i = 0; i < fen.size(); i++) {
-        if (characters.find(fen[i]) != characters.end()) {
-            if (isupper(fen[i])) {
-                *whiteBitboards[helper[fen[i]]] |= 1ULL << curr;
+    vector<string> splitFen;
+    istringstream iss(fen); 
+    string word;
+
+    while (getline(iss, word, ' ')) { 
+        splitFen.push_back(word);
+    }
+
+    for (const std::string& w : splitFen) {
+        std::cout << w << std::endl;
+    }
+
+    for (int i = 0; i < splitFen[0].size(); i++) {
+        if (characters.find(splitFen[0][i]) != characters.end()) {
+            if (isupper(splitFen[0][i])) {
+                *whiteBitboards[helper[splitFen[0][i]]] |= 1ULL << curr;
             } else {
-                *blackBitboards[helper[fen[i]]] |= 1ULL << curr;
+                *blackBitboards[helper[splitFen[0][i]]] |= 1ULL << curr;
             }
             curr--;
-        } else if (isdigit(fen[i])) {
-            curr -= ((fen[i] - '0'));
+        } else if (isdigit(splitFen[0][i])) {
+            curr -= ((splitFen[0][i] - '0'));
         }
     }
+
+    if (splitFen[1] == "w") {
+        whiteTurn = true;
+    } else {
+        whiteTurn = false;
+    }
+
+    if (splitFen[2] == "-") {
+        whiteHCastle = false;
+        whiteACastle = false;
+        blackHCastle = false;
+        blackACastle = false;
+    } else {
+        for (int i = 0; i < splitFen[2].size(); i++) {
+            if (splitFen[2][i] == 'K') {
+                whiteHCastle = true;
+            } else if (splitFen[2][i] == 'Q') {
+                whiteACastle = true;
+            } else if (splitFen[2][i] == 'k') {
+                blackHCastle = true;
+            } else if (splitFen[2][i] == 'q') {
+                blackACastle = true;
+            }
+        }
+    }
+
+    if (splitFen[3] != "-") {
+        whiteTurn ? enPassantSquare = stoi(splitFen[3])-8 : enPassantSquare = stoi(splitFen[3])+8;
+    }    
 
     white_pieces = white_pawns | white_bishops | white_knights | white_rooks | white_queens | white_king;
     black_pieces = black_pawns | black_bishops | black_knights | black_rooks | black_queens | black_king;
@@ -933,165 +1154,17 @@ void MoveGeneration::set_fen(string fen) {
 
 vector<Move> MoveGeneration::bitboard_to_moves(int64_t bitboard, int currentLocation, pieces piece) {
     vector<Move> moves;
-    int64_t temp = bitboard;
-    int newLocation;
-    int originalKingLocation = whiteTurn ? 3 : 59;
+    
 
-    // Check if bitboard is empty; if so, return empty moves
-    if (bitboard == 0) {
-        return moves;
-    }
-
-    while (temp) {
-        // Get the position of the lowest set bit
-        int position = __builtin_ctzll(temp);
-        newLocation = position;
-
-        // Ensure newLocation is within valid range
-        if (newLocation < 0 || newLocation >= 64) {
-            cerr << "Error: newLocation out of bounds: " << newLocation << endl;
-            temp &= (temp - 1); // Remove the lowest set bit and continue
-            continue;
-        }
-
-        // Handle special cases for different pieces
-        if (piece == 0 && newLocation >= 56) { // Example condition, adjust as needed
-            for (int i = 1; i < 5; i++) {
-                Move move(currentLocation, newLocation, -1, i, piece);
-                moves.push_back(move);
-            }
-        } else if (piece == 5 && (currentLocation == originalKingLocation)) { // King castling or move
-            if (whiteTurn && (newLocation == 5 || newLocation == 1)) {
-                Move move(currentLocation, newLocation, 3, -1, piece);
-                moves.push_back(move);
-            } else if (!whiteTurn && (newLocation == 61 || newLocation == 57)) {
-                Move move(currentLocation, newLocation, 3, -1, piece);
-                moves.push_back(move);
-            } else {
-                Move move(currentLocation, newLocation, -1, -1, piece);
-                moves.push_back(move);
-            }
-        } else {
-            Move move(currentLocation, newLocation, -1, -1, piece);
-            moves.push_back(move);
-        }
-
-        // Remove the lowest set bit
-        temp &= (temp - 1);
-    }
 
     return moves;
 }
 
-vector<int> all_set_bits(int64_t bitboard) {
-    vector<int> bits;
-    int64_t temp = bitboard;
-    while (temp) {
-        int position = __builtin_ctzll(temp);
-        bits.push_back(position);
-        temp &= (temp - 1);
-    }
-    return bits;
-}
-
 vector<Move> MoveGeneration::generate_all_moves() {
     vector<Move> moves;
-
-    int64_t* sameColor[6];
-    int64_t* differentColor[6];
-    int kingLocation;
-    vector<int> pawn_locations;
-    vector<int> bishop_locations;
-    vector<int> knight_locations;
-    vector<int> rook_locations;
-    vector<int> queen_locations;
+    
     
 
-    if (whiteTurn) {
-        copy(begin(whiteBitboards), end(whiteBitboards), begin(sameColor));
-        copy(begin(blackBitboards), end(blackBitboards), begin(differentColor));
-        kingLocation = __builtin_ffsll(white_king) - 1;
-        pawn_locations = all_set_bits(white_pawns);
-        bishop_locations = all_set_bits(white_bishops);
-        knight_locations = all_set_bits(white_knights);
-        rook_locations = all_set_bits(white_rooks);
-        queen_locations = all_set_bits(white_queens);
-    } else {
-        copy(begin(blackBitboards), end(blackBitboards), begin(sameColor));
-        copy(begin(whiteBitboards), end(whiteBitboards), begin(differentColor));
-        kingLocation = __builtin_ffsll(black_king) - 1;
-        pawn_locations = all_set_bits(black_pawns);
-        bishop_locations = all_set_bits(black_bishops);
-        knight_locations = all_set_bits(black_knights);
-        rook_locations = all_set_bits(black_rooks);
-        queen_locations = all_set_bits(black_queens);
-    }
-    
-    int64_t checks = check_checker();
-    //Move(before, after, castle, promotion, piece)
-    if (checks == 0) {
-        return bitboard_to_moves(king_moves(kingLocation), kingLocation, KING);
-    } else if (checks != universal) {
-        vector<int> set_bits = all_set_bits(checks);
-        for (int bit : set_bits) {
-            int64_t temp = 1ULL << bit;
-            for (int position : bishop_locations) {
-                if (isPinned(position, BISHOP) & (temp &  generate_diagonal_moves(position))) {
-                    moves.push_back(Move(position, bit, -1, -1, BISHOP));
-                }
-            }
-            for (int position : knight_locations) {
-                if (isPinned(position, KNIGHT) & (temp &  generate_knight_moves(position))) {
-                    moves.push_back(Move(position, bit, -1, -1, KNIGHT));
-                }
-            }
-            for (int position : queen_locations) {
-                if (isPinned(position, QUEEN) & (temp & (generate_diagonal_moves(position) | generate_sideways_moves(position)))) {
-                    moves.push_back(Move(position, bit, -1, -1, QUEEN));
-                }
-            }
-            for (int position : rook_locations) {
-                if (isPinned(position, ROOK) & (temp &  generate_sideways_moves(position))) {
-                    moves.push_back(Move(position, bit, -1, -1, ROOK));
-                }
-            }
-            for (int position : pawn_locations) {
-                if (isPinned(position, PAWN) & (temp &  pawn_moves(position))) {
-                    moves.push_back(Move(position, bit, -1, -1, PAWN));
-                }
-            }
-        }
-        vector<Move> kingMoves = bitboard_to_moves(king_moves(kingLocation), kingLocation, KING);
-        moves.insert(moves.end(), kingMoves.begin(), kingMoves.end());
-        return moves;
-    }
-
-    for (int position : bishop_locations) {
-        vector<Move> bishop_moves = bitboard_to_moves(generate_diagonal_moves(position) & isPinned(position, BISHOP), position, BISHOP);
-        moves.insert(moves.end(), bishop_moves.begin(), bishop_moves.end());
-    }
-    
-    for (int position : knight_locations) {
-        vector<Move> knight_moves = bitboard_to_moves(generate_knight_moves(position) & isPinned(position, KNIGHT), position, KNIGHT);
-        moves.insert(moves.end(), knight_moves.begin(), knight_moves.end());
-    }
-    for (int position : queen_locations) {
-        vector<Move> queen_moves = bitboard_to_moves((generate_diagonal_moves(position) | generate_sideways_moves(position)) & isPinned(position, QUEEN), position, QUEEN);
-        moves.insert(moves.end(), queen_moves.begin(), queen_moves.end());
-    }
-    for (int position : rook_locations) {
-        vector<Move> rook_moves = bitboard_to_moves(generate_sideways_moves(position) & isPinned(position, ROOK), position, ROOK);
-        moves.insert(moves.end(), rook_moves.begin(), rook_moves.end());
-    }
-    
-    for (int position : pawn_locations) {
-        vector<Move> pawns_moves = bitboard_to_moves(pawn_moves(position) & isPinned(position, PAWN), position, PAWN);
-        moves.insert(moves.end(), pawns_moves.begin(), pawns_moves.end());
-    }
-    
-    vector<Move> kingMoves = bitboard_to_moves(king_moves(kingLocation), kingLocation, KING);
-    moves.insert(moves.end(), kingMoves.begin(), kingMoves.end());
-    
     return moves;
 }
 
@@ -1101,35 +1174,10 @@ int MoveGeneration::count_moves(int depth) {
     }
     vector<Move> moves = generate_all_moves();
     int count = 0;
-    int64_t temp_white_pawns = white_pawns;
-    int64_t temp_white_bishops = white_bishops;
-    int64_t temp_white_knights = white_knights;
-    int64_t temp_white_rooks = white_rooks;
-    int64_t temp_white_queens = white_queens;
-    int64_t temp_white_king = white_king;
-
-    int64_t temp_black_pawns = black_pawns;
-    int64_t temp_black_bishops = black_bishops;
-    int64_t temp_black_knights = black_knights;
-    int64_t temp_black_rooks = black_rooks;
-    int64_t temp_black_queens = black_queens;
-    int64_t temp_black_king = black_king;
     for (Move move : moves) {
         make_move(move);
         count += count_moves(depth - 1);
-        white_pawns = temp_white_pawns;
-        white_bishops = temp_white_bishops;
-        white_knights = temp_white_knights;
-        white_rooks = temp_white_rooks;
-        white_queens = temp_white_queens;
-        white_king = temp_white_king;
-        black_pawns = temp_black_pawns;
-        black_bishops = temp_black_bishops;
-        black_knights = temp_black_knights;
-        black_rooks = temp_black_rooks;
-        black_queens = temp_black_queens;
-        black_king = temp_black_king;
-        whiteTurn = !whiteTurn;
+        undo_move(move);
     }
     return count;
 }
@@ -1148,15 +1196,22 @@ int board[8][8] = {
 */
 
 int main() {
-    MoveGeneration thing;
-    thing.initialize_rays();
+    MoveGeneration game;
 
-    print_board(thing.generate_diagonal_moves(44));
+    game.initialize_lookup_table();
+    game.set_fen("8/1N6/4P3/3B4/2p5/5b2/8/7n w - - 0 1");
+    print_all_board(game);
+
+    //game.isPinned(29, KNIGHT);
 
     auto start = high_resolution_clock::now();
-    thing.attacked_by(44);
+    game.generate_sideways_moves(27);
     auto stop = high_resolution_clock::now();
     auto duration = duration_cast<microseconds>(stop - start);
+
     cout << duration.count() << endl;
+
+    print_board(game.generate_diagonal_moves(36));
+
     return 0;
 }
